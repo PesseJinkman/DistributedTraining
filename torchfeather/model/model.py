@@ -11,6 +11,91 @@ from torchfeather.model.model_args import DeepSeekV3ModelArgs
 from torchfeather.model.moe import FeedForward, MoE
 from torchfeather.model.rope import apply_rotary_embm, precompute_freqs_cis
 
+
+class Attention(nn.Module):
+    def __init__(self, model_args: DeepSeekV3ModelArgs):
+        super().__init__()
+
+        self.dim = model_args.dim 
+        self.n_heads = model_args.n_heads
+        self.q_lora_rank = model_args.q_lora_rank
+        self.kv_lora_rank = model_args.kv_lora_rank
+        self.qk_nope_head_dim = model_args.qk_nope_head_dim
+        self.qk_rope_head_dim = model_args.qk_rope_head_dim
+        self.qk_head_dim = (
+            model_args.qk_nope_head_dim + model_args.qk_rope_head_dim
+        )
+        self.v_head_dim = model_args.v_head_dim
+
+        if self.q_lora_rank == 0: # As stated in DeepSeekV2 paper it helps in reducing acivation memory by doing normal attention
+            self.wq = nn.Linear(self.dim, self.n_heads*self.qk_head_dim, bias=False)
+        else:
+            self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+            self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=model_args.norm_eps)
+            self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads*self.qk_head_dim, bias=False)
+
+        self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank+self.qk_rope_head_dim, bias=False) # for block multiplication
+        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=model_args.norm_eps)
+        self.wkv_b = nn.Linear(
+            self.kv_lora_rank, 
+            self.n_heads * (self.qk_nope_head_dim+self.v_head_dim),
+            bias=False
+        )
+
+        self.wo = nn.Linear(self.n_heads*self.v_head_dim, self.dim, bias=False)
+        self.softmax_scale = self.qk_head_dim**-0.5
+
+        if model_args.max_seq_len > model_args.original_seq_len:
+            mscale = 0.1*model_args.mscale*math.log(model_args.rope_factor)+1.0
+            self.softmax_scale = self.softmax_scale*mscale*mscale
+
+        self.inner_attention = ScaledDotProductAttentionWrapper()
+
+    def forward(
+        self, 
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor
+    ):
+        batch_size, seq_len, _ = x.size()
+
+        # Query projection
+        if self.q_lora_rank == 0:
+            q = self.wq(x) # (batch_size, seq_len, n_heads * qk_head_dim)
+        else:
+            q = self.wq_a(x)
+            q = self.wq_b(self.q_norm(q))
+
+        q = q.view(batch_size, seq_len, -1, self.qk_head_dim) # (batch_size, seq_len, n_heads, qk_head_dim)
+
+        q_nope, q_pe = torch.split( # (batch_size, seq_len, n_heads, qk_nope_head_dim), (batch_size, seq_len, n_heads, qk_rope_head_dim)
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1 
+        )
+
+        q_pe = apply_rotary_embm(q_pe, freqs_cis) # (batch_size, seq_len, n_heads, qk_rope_head_dim)
+        q = torch.cat([q_nope, q_pe], dim=-1) # (batch_size, seq_len, n_heads, qk_head_dim)
+
+        kv = self.wkv_a(x) # (batch_size, seq_len, kv_lora_rank+qk_rope_head_dim)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # (batch_size, seq_len, kv_lora_rank), (batch_size, seq_len, qk_rope_head_dim) 
+
+        k_pe = apply_rotary_embm(k_pe.unsqueeze(2), freqs_cis) # (batch_size, seq_len, 1, qk_rope_head_dim)
+
+        kv = self.wkv_b(self.kv_norm(kv)) # (batch_size, seq_len, n_heads * (qk_nope_head_dim+v_head_dim))
+        kv = kv.view(batch_size, seq_len, -1, self.qk_nope_head_dim+self.v_head_dim) # (batch_size, seq_len, n_heads, (qk_nope_head_dim+v_head_dim))
+
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1) # (batch_size, seq_len, n_heads, qk_nope_head_dim), (batch_size, seq_len, n_heads, v_head_dim)
+        k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1) # (batch_size, seq_len, n_heads, qk_head_dim)
+
+        q = q.transpose(1, 2) # (batch_size, n_heads, seq_len, qk_head_dim)
+        k = k.transpose(1, 2) # (batch_size, n_heads, seq_len, qk_head_dim)
+        v = v.transpose(1, 2) # (batch_size, n_heads, seq_len, v_head_dim)
+
+        output = self.inner_attention(q, k, v, scale=self.softmax_scale) # (batch_size, n_heads, seq_len, v_head_dim)
+
+        output = output.transpose(1, 2).contiguous() # (batch_size, seq_len, n_heads, v_head_dim)
+        output = output.view(batch_size, seq_len, -1) # (batch_size, seq_len, n_heads*v_head_dim)
+
+        return self.wo(output) # (batch_size, seq_len, dim)
+
 class TransformerBlock(nn.Module):
 
     def __init__(self, layer_id: int, model_args: DeepSeekV3ModelArgs):
