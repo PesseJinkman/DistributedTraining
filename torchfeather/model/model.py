@@ -9,7 +9,7 @@ from torchfeather.model.attention import (
 )
 from torchfeather.model.model_args import DeepSeekV3ModelArgs
 from torchfeather.model.moe import FeedForward, MoE
-from torchfeather.model.rope import apply_rotary_embm, precompute_freqs_cis
+from torchfeather.model.rope import apply_rotary_emb, precompute_freqs_cis
 
 
 class Attention(nn.Module):
@@ -51,6 +51,28 @@ class Attention(nn.Module):
 
         self.inner_attention = ScaledDotProductAttentionWrapper()
 
+    def init_weights(
+        self,
+        init_std: float,
+        buffer_device: torch.device | None = None,
+    ):
+        linear_list = [
+            self.wkv_a,
+            self.wkv_b,
+        ]
+        if self.q_lora_rank > 0:
+            linear_list.extend([self.wq_a, self.wq_b])
+        else:
+            linear_list.append(self.wq)
+
+        for linear in linear_list:
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+        self.kv_norm.reset_parameters()
+        if self.q_lora_rank > 0:
+            self.q_norm.reset_parameters()
+
     def forward(
         self, 
         x: torch.Tensor,
@@ -62,8 +84,8 @@ class Attention(nn.Module):
         if self.q_lora_rank == 0:
             q = self.wq(x) # (batch_size, seq_len, n_heads * qk_head_dim)
         else:
-            q = self.wq_a(x)
-            q = self.wq_b(self.q_norm(q))
+            q = self.wq_a(x) # (batch_size, seq_len, q_lora_rank)
+            q = self.wq_b(self.q_norm(q)) # (batch_size, seq_len, n_heads * qk_head_dim)
 
         q = q.view(batch_size, seq_len, -1, self.qk_head_dim) # (batch_size, seq_len, n_heads, qk_head_dim)
 
@@ -71,13 +93,13 @@ class Attention(nn.Module):
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1 
         )
 
-        q_pe = apply_rotary_embm(q_pe, freqs_cis) # (batch_size, seq_len, n_heads, qk_rope_head_dim)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis) # (batch_size, seq_len, n_heads, qk_rope_head_dim)
         q = torch.cat([q_nope, q_pe], dim=-1) # (batch_size, seq_len, n_heads, qk_head_dim)
 
         kv = self.wkv_a(x) # (batch_size, seq_len, kv_lora_rank+qk_rope_head_dim)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # (batch_size, seq_len, kv_lora_rank), (batch_size, seq_len, qk_rope_head_dim) 
 
-        k_pe = apply_rotary_embm(k_pe.unsqueeze(2), freqs_cis) # (batch_size, seq_len, 1, qk_rope_head_dim)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis) # (batch_size, seq_len, 1, qk_rope_head_dim)
 
         kv = self.wkv_b(self.kv_norm(kv)) # (batch_size, seq_len, n_heads * (qk_nope_head_dim+v_head_dim))
         kv = kv.view(batch_size, seq_len, -1, self.qk_nope_head_dim+self.v_head_dim) # (batch_size, seq_len, n_heads, (qk_nope_head_dim+v_head_dim))
@@ -95,6 +117,181 @@ class Attention(nn.Module):
         output = output.view(batch_size, seq_len, -1) # (batch_size, seq_len, n_heads*v_head_dim)
 
         return self.wo(output) # (batch_size, seq_len, dim)
+
+    @torch.no_grad()
+    def absorb_mla_weights(self) -> None:
+        if self.q_lora_rank != 0:
+            raise NotImplementedError()
+
+        n_heads = self.n_heads
+        dim = self.dim
+        qk_nope_head_dim = self.qk_nope_head_dim
+        qk_rope_head_dim = self.qk_rope_head_dim
+        v_head_dim = self.v_head_dim
+        kv_lora_rank = self.kv_lora_rank
+
+        device = self.wq.weight.device
+        dtype = self.wq.weight.dtype
+
+        wq = self.wq.weight.view(
+            n_heads,
+            qk_nope_head_dim + qk_rope_head_dim,
+            dim,
+        )
+        # qk_nope: [n_heads, qk_nope_head_dim, dim]
+        # qk_rope: [n_heads, qk_rope_head_dim, dim]
+        wq_nope, wq_rope = torch.split(
+            wq,
+            [qk_nope_head_dim, qk_rope_head_dim],
+            dim=1,
+        )
+
+        wkv_b = self.wkv_b.weight.view(
+            n_heads,
+            qk_nope_head_dim + v_head_dim,
+            kv_lora_rank,
+        )
+        # w_uk: [n_heads, qk_nope_head_dim, kv_lora_rank]
+        # w_uv: [n_heads, v_head_dim, kv_lora_rank]
+        w_uk, w_uv = torch.split(
+            wkv_b,
+            [qk_nope_head_dim, v_head_dim],
+            dim=1,
+        )
+
+        # [n_heads, kv_lora_rank, dim]
+        wq_abs_nope = torch.bmm(
+            w_uk.float().transpose(1, 2), # [n_heads, qk_nope_head_dim, kv_lora_rank] -> [n_heads, kv_lora_rank, qk_nope_head_dim]
+            wq_nope.float(), # [n_heads, qk_nope_head_dim, dim]
+        ).to(dtype=dtype)
+
+        # Each new query head is [absorbed nope | original RoPE].
+        wq_abs = torch.cat(
+            [wq_abs_nope, wq_rope],
+            dim=1,
+        ).reshape(
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            dim,
+        )
+
+        self.wq_abs = nn.Linear(
+            dim,
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wq_abs.weight.copy_(wq_abs)
+        self.wq_abs.requires_grad_(False)
+
+        # [dim, n_heads, v_head_dim] -> [n_heads, dim, v_head_dim]
+        w_o = self.wo.weight.view(
+            dim,
+            n_heads,
+            v_head_dim,
+        ).permute(1, 0, 2)
+
+        # [n_heads, dim, v_head_dim] @ [n_heads, v_head_dim, kv_lora_rank] -> [n_heads, dim, kv_lora_rank]
+        w_o_abs_per_head = torch.bmm(
+            w_o.float(),
+            w_uv.float(),
+        ).to(dtype=dtype)
+
+        # [n_heads, dim, kv_lora_rank] -> [dim, n_heads, kv_lora_rank] -> [dim, n_heads * kv_lora_rank]
+        w_o_abs = w_o_abs_per_head.permute(
+            1,
+            0,
+            2,
+        ).reshape(
+            dim,
+            n_heads * kv_lora_rank,
+        )
+
+        self.wo_abs = nn.Linear(
+            n_heads * kv_lora_rank,
+            dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wo_abs.weight.copy_(w_o_abs)
+        self.wo_abs.requires_grad_(False)
+
+
+    def forward_absorbed(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.wq_abs is not None
+        assert self.wo_abs is not None
+
+        batch_size, seq_len, _ = x.shape
+
+        q = self.wq_abs(x)
+        q = q.view(
+            batch_size,
+            seq_len,
+            self.n_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+
+        # q_nope: [batch_size, seq_len, n_heads, kv_lora_rank]
+        # q_rope: [batch_size, seq_len, n_heads, qk_rope_head_dim]
+        q_nope, q_rope = torch.split(
+            q,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+
+        # [batch_size, seq_len, n_heads, kv_lora_rank + qk_rope_head_dim] -> [batch_size, n_heads, seq_len, kv_lora_rank + qk_rope_head_dim]
+        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)
+
+        # latent_raw: [batch_size, seq_len, kv_lora_rank]
+        # k_rope: [batch_size, seq_len, qk_rope_head_dim]
+        latent_raw, k_rope = torch.split(
+            self.wkv_a(x), # [batch_size, seq_len, dim] -> [batch_size, seq_len, kv_lora_rank + qk_rope_head_dim]
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        # This is the latent that should be cached.
+        # latent: [batch_size, seq_len, kv_lora_rank]
+        latent = self.kv_norm(latent_raw)
+
+        # [batch_size, seq_len, 1, qk_rope_head_dim]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
+
+        # A single shared storage tensor:
+        # shared_cache: [batch_size, seq_len, 1, kv_lora_rank + qk_rope_head_dim] -> [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        shared_cache = torch.cat(
+            [latent.unsqueeze(2), k_rope],
+            dim=-1,
+        ).transpose(1, 2)
+
+        # k: [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        k = shared_cache
+
+        # v: [batch_size, 1, seq_len, kv_lora_rank]
+        v = shared_cache[..., : self.kv_lora_rank]
+
+        # latent_output: [batch_size, n_heads, seq_len, kv_lora_rank]
+        latent_output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+
+        # [batch_size, seq_len, n_heads * kv_lora_rank]
+        latent_output = (
+            latent_output.transpose(1, 2) # [batch_size, n_heads, seq_len, kv_lora_rank] -> [batch_size, seq_len, n_heads, kv_lora_rank]
+            .contiguous()
+            .view(
+                batch_size,
+                seq_len,
+                self.n_heads * self.kv_lora_rank,
+            )
+        )
+
+        # output: [batch_size, seq_len, dim]
+        return self.wo_abs(latent_output)
 
 class TransformerBlock(nn.Module):
 
