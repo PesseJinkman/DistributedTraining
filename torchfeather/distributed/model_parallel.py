@@ -117,7 +117,7 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config)
     disable_fsdp_gradient_division(model)
 
-        # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs in EP could interfere with implicit prefetching in FSDP
+    # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs in EP could interfere with implicit prefetching in FSDP
     if ep_degree == 1:
         return
 
