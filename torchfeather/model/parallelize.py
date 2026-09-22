@@ -175,4 +175,95 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
 
     logger.info("Compiling each TransformerBlock with torch.compile")
         
-    
+def apply_non_moe_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    loss_parallel: bool,
+):
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "tok_embeddings": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "norm": SequenceParallel(),
+            "output": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if loss_parallel else Replicate(),
+                use_local_output=not loss_parallel
+            )
+        }
+    )
+
+    for transformer_block in model.layers.values():
+        layer_plan: dict[str, ParallelStyle] = {
+            "attention_norm": SequenceParallel(),
+            "attention": PrepareModuleInput(
+                input_layouts=(Shard(1), Replicate()),
+                desired_input_layouts=(Replicate(), Replicate()),
+            ),
+            "attention.wkv_a": NoParallel(
+                use_local_output=False
+            ),
+            "attention.wkv_b": ColwiseParallel(
+                use_local_output=False
+            ),
+            "attention.kv_norm": NoParallel(
+                use_local_output=False
+            ),
+            "attention.inner_attention": PrepareModuleInput(
+                input_layouts=(Shard(1), Shard(1), Shard(1)),
+                desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
+                use_local_output=False
+            ),
+            "attention.wo": RowwiseParallel(
+                output_layouts=Shard(1)
+            ),
+            "ffn_norm": SequenceParallel(),
+        }
+
+        if transformer_block.attention.q_lora_rank == 0:
+            layer_plan.update(
+                {
+                    "attention.wq": ColwiseParallel(
+                        use_local_output=False
+                    ),  # This is only used when q_lora_rank==0
+                }
+            )
+        else:
+            layer_plan.update(
+                {
+                    "attention.wq_a": NoParallel(
+                        use_local_output=False
+                    ),  # Same reasoning as above, no need to shard since it's not per-head
+                    "attention.wq_b": ColwiseParallel(
+                        use_local_output=False
+                    ),  # Can shard, because it's per head
+                    "attention.q_norm": NoParallel(use_local_output=False),
+                }
+            )
+
+        if not transformer_block.moe_enabled:
+            layer_plan.update(
+                {
+                    # The input of this comes from `ffn_norm`, which is SP.
+                    # We are entering a TP region after a SP region, so we must have the entire input as required by TP.
+                    "feed_forward": PrepareModuleInput(
+                        input_layouts=(Shard(1),),
+                        desired_input_layouts=(Replicate(),),
+                    ),
+                    "feed_forward.w1": ColwiseParallel(),
+                    "feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)),
+                    "feed_forward.w3": ColwiseParallel(),
+                }
+            )
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+    logger.info("Applied Tensor Parallelism to the model")
