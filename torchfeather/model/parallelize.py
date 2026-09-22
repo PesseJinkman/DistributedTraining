@@ -264,6 +264,6 @@ def apply_non_moe_tp(
             module=transformer_block,
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
-        )
+        ) 
 
     logger.info("Applied Tensor Parallelism to the model")
